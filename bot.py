@@ -85,6 +85,20 @@ def connect_to_iq_option():
         return False
 
 
+def get_open_state(iq, asset):
+    """
+    يرجع حالتي الفتح لـ Digital و Turbo للأصل المطلوب.
+    """
+    try:
+        ot = iq.get_all_open_time()
+        digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
+        turbo_open   = bool(ot.get('turbo',   {}).get(asset, {}).get('open'))
+        return digital_open, turbo_open
+    except Exception as e:
+        logger.error(f"⚠️ تعذر جلب حالة فتح الأصل {asset}: {e}")
+        return False, False
+
+
 def reset_daily_counters_if_needed():
     """إعادة تعيين عدادات التداول اليومية عند الانتقال إلى يوم جديد."""
     global daily_trades, daily_pnl, last_daily_reset
@@ -146,7 +160,7 @@ def _monitor_trade_result(iq, order_id, asset, direction, is_digital):
 
 
 def place_trade(iq, asset, direction):
-    """إرسال صفقة مع مراعاة التبريد واستراتيجية التنفيذ الاحتياطية."""
+    """إرسال صفقة مع مراعاة التبريد واختيار الأداة الأنسب (Digital ثم Turbo)."""
     reset_daily_counters_if_needed()
 
     now = time.time()
@@ -154,16 +168,28 @@ def place_trade(iq, asset, direction):
         logger.info(f"⏳ تبريد مفعّل لـ {asset}.. تخطي الدخول")
         return False
 
-    is_digital = True
-    ok, order_id = iq.buy_digital_spot(asset, TRADE_AMOUNT, direction, EXPIRY_MIN)
-    if not ok:
-        is_digital = False
+    digital_open, turbo_open = get_open_state(iq, asset)
+
+    ok = False
+    order_id = None
+    is_digital = False
+
+    # 1) جرّب Digital إذا كان مفتوحًا
+    if digital_open:
+        logger.info(f"🛒 محاولة تنفيذ Digital على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
+        is_digital = True
+        ok, order_id = iq.buy_digital_spot(asset, TRADE_AMOUNT, direction, EXPIRY_MIN)
+        if not ok:
+            logger.info(f"↩️ فشل Digital على {asset}، سنحاول Turbo إن أمكن")
+            is_digital = False  # سنحوّل لمحاولة Turbo
+
+    # 2) إن لم ينجح Digital وTurbo مفتوح — جرّب Turbo
+    if not ok and turbo_open:
+        logger.info(f"🛒 محاولة تنفيذ Turbo على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
 
     if ok:
-        logger.warning(
-            f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id}"
-        )
+        logger.warning(f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id} | mode={'DIGITAL' if is_digital else 'TURBO'}")
         last_trade_ts[asset] = now
         global daily_trades
         with daily_lock:
@@ -173,10 +199,13 @@ def place_trade(iq, asset, direction):
             args=(iq, order_id, asset, direction, is_digital),
             daemon=True,
         ).start()
+        return True
     else:
-        logger.error(f"❌ فشل إرسال الصفقة على {asset}")
-
-    return ok
+        if not (digital_open or turbo_open):
+            logger.error(f"❌ فشل إرسال الصفقة: {asset} مغلق الآن (لا Digital ولا Turbo).")
+        else:
+            logger.error(f"❌ فشل إرسال الصفقة على {asset} رغم كون الأداة مفتوحة. تحقق من صلاحية الحساب أو توقيت الشمعة.")
+        return False
 
 # ==============================================================================
 # --- 3. وظائف الاستراتيجية والتحليل ---
@@ -192,16 +221,32 @@ def get_tradable_assets(base_assets, notified_assets):
         all_profit = Iq.get_all_profit()
         tradable_assets = []
         now = time.time()
-        
+        # نجلب أوقات الفتح مرة واحدة لهذه الدورة
+        ot = Iq.get_all_open_time()
+
         for asset in base_assets:
-            # تخطي الأصل إذا تم إرسال تنبيه له مؤخراً
+            # تبريد التنبيهات
             if asset in notified_assets and now < notified_assets[asset]:
                 continue
 
-            # التحقق من أن الأصل متاح ونسبة الربح مقبولة
-            if asset in all_profit and 'turbo' in all_profit[asset] and all_profit[asset]['turbo'] * 100 >= MINIMUM_PAYOUT:
-                tradable_assets.append({'name': asset, 'payout': all_profit[asset]['turbo'] * 100})
-        
+            digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
+            turbo_open   = bool(ot.get('turbo',   {}).get(asset, {}).get('open'))
+
+            if not (digital_open or turbo_open):
+                continue  # الأصل غير مفتوح بأي أداة
+
+            ap = all_profit.get(asset, {})
+            # أعلى عائد متاح بين digital و turbo
+            payout_candidates = []
+            if digital_open and 'digital' in ap and ap['digital']:
+                payout_candidates.append(ap['digital'] * 100)
+            if turbo_open and 'turbo' in ap and ap['turbo']:
+                payout_candidates.append(ap['turbo'] * 100)
+
+            payout = max(payout_candidates) if payout_candidates else 0
+            if payout >= MINIMUM_PAYOUT:
+                tradable_assets.append({'name': asset, 'payout': payout})
+
         if tradable_assets:
             logger.info(f"Found {len(tradable_assets)} tradable assets to monitor.")
         else:
@@ -267,6 +312,10 @@ def run_signal_generator():
     logger.info(f"==================================================================")
     logger.info(f"Today is {datetime.datetime.now().strftime('%A')}, scanning for {market_type} assets.")
     logger.info(f"💡 Strategy Activated: Active MA Cross Strategy (1-min timeframe)")
+    logger.info(
+        f"CONFIG => AUTO_TRADE={AUTO_TRADE}, TRADE_AMOUNT={TRADE_AMOUNT}, EXPIRY_MIN={EXPIRY_MIN}, "
+        f"COOLDOWN_S={COOLDOWN_S}, MAX_DAILY_TRADES={MAX_DAILY_TRADES}, MAX_DAILY_LOSS={MAX_DAILY_LOSS}"
+    )
 
     while True:
         try:
@@ -299,13 +348,15 @@ def run_signal_generator():
                 if data_df is not None:
                     signal = check_signal_ma_cross(data_df)
                     if signal != "NONE":
+                        allowed = may_continue()
+                        logger.info(f"Signal on {asset_name}: {signal}, AUTO_TRADE={AUTO_TRADE}, ALLOWED={allowed}")
                         # --- إرسال التنبيه الصوتي والمرئي ---
                         print('\a') # إصدار صوت "بيب"
                         logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                         logger.warning(f"🚨🚨🚨 STRONG {signal} SIGNAL ON {asset_name} (Payout: {asset_payout:.0f}%) 🚨🚨🚨")
 
                         manual_required = True
-                        if AUTO_TRADE and may_continue():
+                        if AUTO_TRADE and allowed:
                             direction = signal.lower()
                             if place_trade(Iq, asset_name, direction):
                                 manual_required = False
