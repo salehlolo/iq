@@ -37,7 +37,7 @@ EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "1"))  # انتهاء الصفقة با
 COOLDOWN_S = int(os.getenv("COOLDOWN_S", "120"))  # فترة تبريد لكل أصل لمنع تكرار الدخول
 last_trade_ts = {}
 
-ENABLE_DIGITAL = _bool_env("ENABLE_DIGITAL", False)
+ENABLE_DIGITAL = _bool_env("ENABLE_DIGITAL", False)  # عطّل Digital افتراضيًا
 
 # -- حدود إدارة المخاطر اليومية --
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "20"))
@@ -89,7 +89,7 @@ def connect_to_iq_option():
 
 def get_open_state(iq, asset):
     """
-    يرجع حالتي الفتح لـ Digital و Turbo للأصل المطلوب، مع احترام ENABLE_DIGITAL.
+    يرجع حالتي الفتح لـ Digital و Turbo مع احترام ENABLE_DIGITAL.
     """
     digital_open = False
     turbo_open = False
@@ -103,7 +103,6 @@ def get_open_state(iq, asset):
         turbo_open = bool(ot.get('turbo', {}).get(asset, {}).get('open'))
     except Exception as e:
         logger.error(f"⚠️ تعذر جلب حالة الفتح لـ {asset}: {e}")
-        # سنرجع (False, False) ببساطة
     return digital_open, turbo_open
 
 
@@ -182,7 +181,7 @@ def place_trade(iq, asset, direction):
     order_id = None
     is_digital = False
 
-    # 1) Digital أولًا فقط إذا مفعّل ومفتوح
+    # Digital أولًا فقط إذا مفعّل ومفتوح
     if ENABLE_DIGITAL and digital_open:
         logger.info(f"🛒 محاولة تنفيذ Digital على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         is_digital = True
@@ -191,7 +190,7 @@ def place_trade(iq, asset, direction):
             logger.info(f"↩️ فشل Digital على {asset}، سنحاول Turbo إن أمكن")
             is_digital = False
 
-    # 2) Turbo
+    # Turbo
     if not ok and turbo_open:
         logger.info(f"🛒 محاولة تنفيذ Turbo على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
@@ -221,14 +220,14 @@ def place_trade(iq, asset, direction):
 
 def get_tradable_assets(base_assets, notified_assets):
     """
-    مسح السوق: يرجع أصولًا مفتوحة (Turbo أو Digital حسب الفلاغ) وبعائد كافٍ.
+    يمسح السوق ويعيد أصولًا مفتوحة (Turbo أو Digital حسب الفلاغ) وبعائد كافٍ.
     """
     logger.info("Scanning market for tradable assets...")
     try:
         tradable_assets = []
         now = time.time()
 
-        # جلب العوائد وأوقات الفتح
+        # جلب العوائد وأوقات الفتح بأمان
         try:
             all_profit = Iq.get_all_profit() or {}
         except Exception as e:
@@ -255,12 +254,13 @@ def get_tradable_assets(base_assets, notified_assets):
                     digital_open = False
             turbo_open = bool(ot.get('turbo', {}).get(asset, {}).get('open'))
 
+            # الأصل مفتوح إذا Turbo مفتوح، أو Digital مفتوح ومُفعّل
             if not (turbo_open or (ENABLE_DIGITAL and digital_open)):
-                continue  # الأصل غير مفتوح وفق السياسة الحالية
+                continue
 
             ap = all_profit.get(asset, {}) or {}
 
-            # اجمع المرشحين للعائد من المفاتيح المتاحة
+            # احسب أعلى عائد متاح بين digital/turbo/binary
             payout_candidates = []
             for key in ("digital", "turbo", "binary"):
                 try:
