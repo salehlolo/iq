@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import os
 import time
 import logging
+import threading
 from iqoptionapi.stable_api import IQ_Option
 import pandas as pd
 import pandas_ta as ta
@@ -19,6 +21,30 @@ ACCOUNT_TYPE = "PRACTICE"
 
 # -- إعدادات التداول --
 MINIMUM_PAYOUT = 70 # لن يتم البحث عن إشارة إذا كانت نسبة الربح أقل من هذا الرقم
+
+
+def _bool_env(var_name, default):
+    value = os.getenv(var_name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# -- إعدادات التنفيذ التلقائي --
+AUTO_TRADE = _bool_env("AUTO_TRADE", True)  # شغّل/طفّي التنفيذ التلقائي
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "1"))  # قيمة الصفقة
+EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "1"))  # انتهاء الصفقة بالدقائق (١ دقيقة)
+COOLDOWN_S = int(os.getenv("COOLDOWN_S", "120"))  # فترة تبريد لكل أصل لمنع تكرار الدخول
+last_trade_ts = {}
+
+# -- حدود إدارة المخاطر اليومية --
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "20"))
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "50"))  # بالدولار مثلاً
+
+daily_trades = 0
+daily_pnl = 0.0
+daily_lock = threading.Lock()
+last_daily_reset = datetime.date.today()
 
 # -- قوائم الأصول للمسح (مقسمة حسب أيام الأسبوع) --
 WEEKDAY_ASSETS_TO_SCAN = [
@@ -42,20 +68,115 @@ SLOW_MA_PERIOD = 21     # المتوسط المتحرك البطيء
 
 # إعداد نظام تسجيل الأحداث لعرض المعلومات بشكل واضح
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 Iq = IQ_Option(EMAIL, PASSWORD)
 
 def connect_to_iq_option():
     """يقوم بالاتصال أو إعادة الاتصال بالمنصة بشكل آمن."""
-    logging.info("Attempting to connect to IQ Option...")
+    logger.info("Attempting to connect to IQ Option...")
     check, reason = Iq.connect()
     if check:
-        logging.info("✅ Successfully connected!")
+        logger.info("✅ Successfully connected!")
         Iq.change_balance(ACCOUNT_TYPE)
-        logging.info(f"👍 Switched to {ACCOUNT_TYPE} account.")
+        logger.info(f"👍 Switched to {ACCOUNT_TYPE} account.")
         return True
     else:
-        logging.error(f"❌ Connection failed, reason: {reason}")
+        logger.error(f"❌ Connection failed, reason: {reason}")
         return False
+
+
+def reset_daily_counters_if_needed():
+    """إعادة تعيين عدادات التداول اليومية عند الانتقال إلى يوم جديد."""
+    global daily_trades, daily_pnl, last_daily_reset
+    today = datetime.date.today()
+    with daily_lock:
+        if today != last_daily_reset:
+            daily_trades = 0
+            daily_pnl = 0.0
+            last_daily_reset = today
+            logger.info("🔄 تمت إعادة تعيين عدادات التداول اليومية.")
+
+
+def may_continue():
+    """التحقق من حدود إدارة المخاطر قبل الدخول في صفقة جديدة."""
+    reset_daily_counters_if_needed()
+    with daily_lock:
+        if daily_trades >= MAX_DAILY_TRADES:
+            logger.warning("⛔ وصلنا الحد اليومي للصفقات")
+            return False
+        if daily_pnl <= -MAX_DAILY_LOSS:
+            logger.warning("⛔ وصلنا حد الخسارة اليومية")
+            return False
+    return True
+
+
+def _await_trade_result(iq, order_id, asset, direction, is_digital):
+    """الانتظار حتى تُغلق الصفقة ثم إعادة صافي الربح/الخسارة."""
+    try:
+        if is_digital:
+            while True:
+                status, result = iq.check_win_digital_v2(order_id)
+                if status:
+                    return result
+                time.sleep(2)
+        else:
+            while True:
+                result = iq.check_win_v4(order_id)
+                if result is not None:
+                    return result
+                time.sleep(2)
+    except Exception as exc:
+        logger.error(f"⚠️ تعذر التحقق من نتيجة الصفقة {order_id} على {asset}: {exc}")
+    return 0.0
+
+
+def _monitor_trade_result(iq, order_id, asset, direction, is_digital):
+    """متابعة نتيجة الصفقة لتحديث عدادات المخاطر اليومية."""
+    global daily_pnl
+    profit = _await_trade_result(iq, order_id, asset, direction, is_digital)
+    with daily_lock:
+        daily_pnl += profit
+
+    if profit > 0:
+        logger.info(f"✅ الصفقة {direction.upper()} على {asset} انتهت بربح {profit:.2f}$")
+    elif profit < 0:
+        logger.info(f"❌ الصفقة {direction.upper()} على {asset} انتهت بخسارة {profit:.2f}$")
+    else:
+        logger.info(f"➖ الصفقة {direction.upper()} على {asset} انتهت بالتعادل")
+
+
+def place_trade(iq, asset, direction):
+    """إرسال صفقة مع مراعاة التبريد واستراتيجية التنفيذ الاحتياطية."""
+    reset_daily_counters_if_needed()
+
+    now = time.time()
+    if now - last_trade_ts.get(asset, 0) < COOLDOWN_S:
+        logger.info(f"⏳ تبريد مفعّل لـ {asset}.. تخطي الدخول")
+        return False
+
+    is_digital = True
+    ok, order_id = iq.buy_digital_spot(asset, TRADE_AMOUNT, direction, EXPIRY_MIN)
+    if not ok:
+        is_digital = False
+        ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
+
+    if ok:
+        logger.warning(
+            f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id}"
+        )
+        last_trade_ts[asset] = now
+        global daily_trades
+        with daily_lock:
+            daily_trades += 1
+        threading.Thread(
+            target=_monitor_trade_result,
+            args=(iq, order_id, asset, direction, is_digital),
+            daemon=True,
+        ).start()
+    else:
+        logger.error(f"❌ فشل إرسال الصفقة على {asset}")
+
+    return ok
 
 # ==============================================================================
 # --- 3. وظائف الاستراتيجية والتحليل ---
@@ -66,7 +187,7 @@ def get_tradable_assets(base_assets, notified_assets):
     يقوم بمسح السوق ويعيد قائمة بالأصول المفتوحة والتي لديها نسبة ربح جيدة
     والتي لم يتم إرسال تنبيه بشأنها مؤخراً.
     """
-    logging.info("Scanning market for tradable assets...")
+    logger.info("Scanning market for tradable assets...")
     try:
         all_profit = Iq.get_all_profit()
         tradable_assets = []
@@ -82,20 +203,20 @@ def get_tradable_assets(base_assets, notified_assets):
                 tradable_assets.append({'name': asset, 'payout': all_profit[asset]['turbo'] * 100})
         
         if tradable_assets:
-            logging.info(f"Found {len(tradable_assets)} tradable assets to monitor.")
+            logger.info(f"Found {len(tradable_assets)} tradable assets to monitor.")
         else:
-            logging.warning("No tradable assets with sufficient payout found at the moment.")
+            logger.warning("No tradable assets with sufficient payout found at the moment.")
         return tradable_assets
     except Exception as e:
-        logging.error(f"Could not scan market due to an error: {e}")
+        logger.error(f"Could not scan market due to an error: {e}")
         return []
 
 
 def get_and_prepare_data(asset):
     """يجلب بيانات الشموع ويضيف إليها المتوسطات المتحركة."""
     candles = Iq.get_candles(asset, TIMEFRAME, CANDLE_COUNT, time.time())
-    if not candles: 
-        logging.warning(f"Could not fetch candle data for {asset}.")
+    if not candles:
+        logger.warning(f"Could not fetch candle data for {asset}.")
         return None
     df = pd.DataFrame(candles)
     df.rename(columns={'min': 'low', 'max': 'high'}, inplace=True)
@@ -141,22 +262,24 @@ def run_signal_generator():
     base_asset_list = WEEKEND_ASSETS_TO_SCAN if datetime.datetime.now().weekday() >= 5 else WEEKDAY_ASSETS_TO_SCAN
     market_type = "OTC (Weekend)" if datetime.datetime.now().weekday() >= 5 else "Forex (Weekday)"
 
-    logging.info(f"==================================================================")
-    logging.info(f"🤖 PROFESSIONAL SIGNAL GENERATOR - STARTED SUCCESSFULLY ?")
-    logging.info(f"==================================================================")
-    logging.info(f"Today is {datetime.datetime.now().strftime('%A')}, scanning for {market_type} assets.")
-    logging.info(f"💡 Strategy Activated: Active MA Cross Strategy (1-min timeframe)")
+    logger.info(f"==================================================================")
+    logger.info(f"🤖 PROFESSIONAL SIGNAL GENERATOR - STARTED SUCCESSFULLY ?")
+    logger.info(f"==================================================================")
+    logger.info(f"Today is {datetime.datetime.now().strftime('%A')}, scanning for {market_type} assets.")
+    logger.info(f"💡 Strategy Activated: Active MA Cross Strategy (1-min timeframe)")
 
     while True:
         try:
+            reset_daily_counters_if_needed()
+
             # فحص الاتصال في بداية كل دورة لضمان الموثوقية
             if not Iq.check_connect():
-                logging.warning("Connection lost! Attempting to reconnect...")
+                logger.warning("Connection lost! Attempting to reconnect...")
                 connect_to_iq_option()
                 time.sleep(5)
                 continue
 
-            logging.info("--------------------------------------------------")
+            logger.info("--------------------------------------------------")
             
             # مسح السوق بحثاً عن أصول متاحة للتداول
             tradable_assets = get_tradable_assets(base_asset_list, notified_assets)
@@ -170,7 +293,7 @@ def run_signal_generator():
                 asset_name = asset_info['name']
                 asset_payout = asset_info['payout']
 
-                logging.info(f"🔍 Analyzing: {asset_name} (Payout: {asset_payout:.0f}%)")
+                logger.info(f"🔍 Analyzing: {asset_name} (Payout: {asset_payout:.0f}%)")
                 data_df = get_and_prepare_data(asset_name)
 
                 if data_df is not None:
@@ -178,21 +301,31 @@ def run_signal_generator():
                     if signal != "NONE":
                         # --- إرسال التنبيه الصوتي والمرئي ---
                         print('\a') # إصدار صوت "بيب"
-                        logging.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                        logging.warning(f"🚨🚨🚨 STRONG {signal} SIGNAL ON {asset_name} (Payout: {asset_payout:.0f}%) 🚨🚨🚨")
-                        logging.warning(">>>>> PLEASE CHECK THE CHART AND PLACE TRADE MANUALLY! <<<<<")
-                        logging.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                        logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                        logger.warning(f"🚨🚨🚨 STRONG {signal} SIGNAL ON {asset_name} (Payout: {asset_payout:.0f}%) 🚨🚨🚨")
+
+                        manual_required = True
+                        if AUTO_TRADE and may_continue():
+                            direction = signal.lower()
+                            if place_trade(Iq, asset_name, direction):
+                                manual_required = False
+
+                        if manual_required:
+                            logger.warning("🚨🚨🚨 STRONG ... تحقّق يدويًا")
+                            logger.warning(">>>>> PLEASE CHECK THE CHART AND PLACE TRADE MANUALLY! <<<<<")
+
+                        logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                         
                         # إضافة الأصل إلى قائمة التهدئة لمنع تكرار التنبيهات
                         notified_assets[asset_name] = time.time() + NOTIFICATION_COOLDOWN
                 
                 time.sleep(2) # تأخير بسيط بين فحص كل أصل
 
-            logging.info("⏳ Scan complete. No new signals found. Re-scanning in 30 seconds.")
+            logger.info("⏳ Scan complete. No new signals found. Re-scanning in 30 seconds.")
             time.sleep(30)
 
         except Exception as e:
-            logging.error(f"A critical error occurred: {e}. Attempting to reconnect...")
+            logger.error(f"A critical error occurred: {e}. Attempting to reconnect...")
             time.sleep(60)
             connect_to_iq_option()
 
