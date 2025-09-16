@@ -37,6 +37,8 @@ EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "1"))  # انتهاء الصفقة با
 COOLDOWN_S = int(os.getenv("COOLDOWN_S", "120"))  # فترة تبريد لكل أصل لمنع تكرار الدخول
 last_trade_ts = {}
 
+ENABLE_DIGITAL = _bool_env("ENABLE_DIGITAL", False)
+
 # -- حدود إدارة المخاطر اليومية --
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "20"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "50"))  # بالدولار مثلاً
@@ -87,16 +89,22 @@ def connect_to_iq_option():
 
 def get_open_state(iq, asset):
     """
-    يرجع حالتي الفتح لـ Digital و Turbo للأصل المطلوب.
+    يرجع حالتي الفتح لـ Digital و Turbo للأصل المطلوب، مع احترام ENABLE_DIGITAL.
     """
+    digital_open = False
+    turbo_open = False
     try:
-        ot = iq.get_all_open_time()
-        digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
-        turbo_open   = bool(ot.get('turbo',   {}).get(asset, {}).get('open'))
-        return digital_open, turbo_open
+        ot = iq.get_all_open_time() or {}
+        if ENABLE_DIGITAL:
+            try:
+                digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
+            except Exception:
+                digital_open = False
+        turbo_open = bool(ot.get('turbo', {}).get(asset, {}).get('open'))
     except Exception as e:
-        logger.error(f"⚠️ تعذر جلب حالة فتح الأصل {asset}: {e}")
-        return False, False
+        logger.error(f"⚠️ تعذر جلب حالة الفتح لـ {asset}: {e}")
+        # سنرجع (False, False) ببساطة
+    return digital_open, turbo_open
 
 
 def reset_daily_counters_if_needed():
@@ -174,16 +182,16 @@ def place_trade(iq, asset, direction):
     order_id = None
     is_digital = False
 
-    # 1) جرّب Digital إذا كان مفتوحًا
-    if digital_open:
+    # 1) Digital أولًا فقط إذا مفعّل ومفتوح
+    if ENABLE_DIGITAL and digital_open:
         logger.info(f"🛒 محاولة تنفيذ Digital على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         is_digital = True
         ok, order_id = iq.buy_digital_spot(asset, TRADE_AMOUNT, direction, EXPIRY_MIN)
         if not ok:
             logger.info(f"↩️ فشل Digital على {asset}، سنحاول Turbo إن أمكن")
-            is_digital = False  # سنحوّل لمحاولة Turbo
+            is_digital = False
 
-    # 2) إن لم ينجح Digital وTurbo مفتوح — جرّب Turbo
+    # 2) Turbo
     if not ok and turbo_open:
         logger.info(f"🛒 محاولة تنفيذ Turbo على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
@@ -213,37 +221,56 @@ def place_trade(iq, asset, direction):
 
 def get_tradable_assets(base_assets, notified_assets):
     """
-    يقوم بمسح السوق ويعيد قائمة بالأصول المفتوحة والتي لديها نسبة ربح جيدة
-    والتي لم يتم إرسال تنبيه بشأنها مؤخراً.
+    مسح السوق: يرجع أصولًا مفتوحة (Turbo أو Digital حسب الفلاغ) وبعائد كافٍ.
     """
     logger.info("Scanning market for tradable assets...")
     try:
-        all_profit = Iq.get_all_profit()
         tradable_assets = []
         now = time.time()
-        # نجلب أوقات الفتح مرة واحدة لهذه الدورة
-        ot = Iq.get_all_open_time()
+
+        # جلب العوائد وأوقات الفتح
+        try:
+            all_profit = Iq.get_all_profit() or {}
+        except Exception as e:
+            logger.error(f"⚠️ تعذر جلب العوائد: {e}")
+            all_profit = {}
+
+        try:
+            ot = Iq.get_all_open_time() or {}
+        except Exception as e:
+            logger.error(f"⚠️ تعذر جلب أوقات الفتح: {e}")
+            ot = {}
 
         for asset in base_assets:
             # تبريد التنبيهات
             if asset in notified_assets and now < notified_assets[asset]:
                 continue
 
-            digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
-            turbo_open   = bool(ot.get('turbo',   {}).get(asset, {}).get('open'))
+            # حالات الفتح
+            digital_open = False
+            if ENABLE_DIGITAL:
+                try:
+                    digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
+                except Exception:
+                    digital_open = False
+            turbo_open = bool(ot.get('turbo', {}).get(asset, {}).get('open'))
 
-            if not (digital_open or turbo_open):
-                continue  # الأصل غير مفتوح بأي أداة
+            if not (turbo_open or (ENABLE_DIGITAL and digital_open)):
+                continue  # الأصل غير مفتوح وفق السياسة الحالية
 
-            ap = all_profit.get(asset, {})
-            # أعلى عائد متاح بين digital و turbo
+            ap = all_profit.get(asset, {}) or {}
+
+            # اجمع المرشحين للعائد من المفاتيح المتاحة
             payout_candidates = []
-            if digital_open and 'digital' in ap and ap['digital']:
-                payout_candidates.append(ap['digital'] * 100)
-            if turbo_open and 'turbo' in ap and ap['turbo']:
-                payout_candidates.append(ap['turbo'] * 100)
+            for key in ("digital", "turbo", "binary"):
+                try:
+                    val = ap.get(key)
+                    if val:
+                        payout_candidates.append(float(val) * 100.0)
+                except Exception:
+                    pass
 
-            payout = max(payout_candidates) if payout_candidates else 0
+            payout = max(payout_candidates) if payout_candidates else 0.0
             if payout >= MINIMUM_PAYOUT:
                 tradable_assets.append({'name': asset, 'payout': payout})
 
@@ -316,6 +343,7 @@ def run_signal_generator():
         f"CONFIG => AUTO_TRADE={AUTO_TRADE}, TRADE_AMOUNT={TRADE_AMOUNT}, EXPIRY_MIN={EXPIRY_MIN}, "
         f"COOLDOWN_S={COOLDOWN_S}, MAX_DAILY_TRADES={MAX_DAILY_TRADES}, MAX_DAILY_LOSS={MAX_DAILY_LOSS}"
     )
+    logger.info(f"ENABLE_DIGITAL={ENABLE_DIGITAL}")
 
     while True:
         try:
