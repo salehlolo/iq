@@ -20,7 +20,7 @@ PASSWORD = "01227372440Saleh"
 ACCOUNT_TYPE = "PRACTICE"
 
 # -- إعدادات التداول --
-MINIMUM_PAYOUT = 70 # لن يتم البحث عن إشارة إذا كانت نسبة الربح أقل من هذا الرقم
+MINIMUM_PAYOUT = int(os.getenv("MINIMUM_PAYOUT", "70"))
 
 
 def _bool_env(var_name, default):
@@ -89,21 +89,32 @@ def connect_to_iq_option():
 
 def get_open_state(iq, asset):
     """
-    يرجع حالتي الفتح لـ Digital و Turbo مع احترام ENABLE_DIGITAL.
+    يرجع حالتي الفتح لـ Digital و (Turbo/Binary قصير المدى) مع احترام ENABLE_DIGITAL.
     """
     digital_open = False
-    turbo_open = False
+    short_open = False  # Turbo أو Binary
+
     try:
         ot = iq.get_all_open_time() or {}
+
         if ENABLE_DIGITAL:
             try:
                 digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
             except Exception:
                 digital_open = False
-        turbo_open = bool(ot.get('turbo', {}).get(asset, {}).get('open'))
+
+        # اعتبر أي من turbo أو binary كـ "قصير المدى" مفتوح
+        for cat in ("turbo", "binary"):
+            try:
+                if bool(ot.get(cat, {}).get(asset, {}).get('open')):
+                    short_open = True
+                    break
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"⚠️ تعذر جلب حالة الفتح لـ {asset}: {e}")
-    return digital_open, turbo_open
+
+    return digital_open, short_open
 
 
 def reset_daily_counters_if_needed():
@@ -175,7 +186,7 @@ def place_trade(iq, asset, direction):
         logger.info(f"⏳ تبريد مفعّل لـ {asset}.. تخطي الدخول")
         return False
 
-    digital_open, turbo_open = get_open_state(iq, asset)
+    digital_open, short_open = get_open_state(iq, asset)
 
     ok = False
     order_id = None
@@ -191,7 +202,7 @@ def place_trade(iq, asset, direction):
             is_digital = False
 
     # Turbo
-    if not ok and turbo_open:
+    if not ok and short_open:
         logger.info(f"🛒 محاولة تنفيذ Turbo على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
 
@@ -208,8 +219,8 @@ def place_trade(iq, asset, direction):
         ).start()
         return True
     else:
-        if not (digital_open or turbo_open):
-            logger.error(f"❌ فشل إرسال الصفقة: {asset} مغلق الآن (لا Digital ولا Turbo).")
+        if not (digital_open or short_open):
+            logger.error(f"❌ فشل إرسال الصفقة: {asset} مغلق الآن (لا Digital ولا Turbo/Binary).")
         else:
             logger.error(f"❌ فشل إرسال الصفقة على {asset} رغم كون الأداة مفتوحة. تحقق من صلاحية الحساب أو توقيت الشمعة.")
         return False
@@ -218,9 +229,43 @@ def place_trade(iq, asset, direction):
 # --- 3. وظائف الاستراتيجية والتحليل ---
 # ==============================================================================
 
+def _best_payout_from_all_profit(all_profit, asset):
+    """
+    يدعم شكلين من هيكلة get_all_profit:
+    A) {asset: {'turbo':0.84,'digital':0.84,'binary':0.84}}
+    B) {'turbo':{asset:0.84}, 'digital':{asset:0.84}, 'binary':{asset:0.84}}
+    يرجّع أعلى عائد كنسبة مئوية [0..100]
+    """
+    candidates = []
+
+    # شكل A: متمركز حول الأصل
+    try:
+        ap = all_profit.get(asset, {})
+        if isinstance(ap, dict):
+            for key in ("digital", "turbo", "binary"):
+                v = ap.get(key)
+                if v:
+                    candidates.append(float(v) * 100.0)
+    except Exception:
+        pass
+
+    # شكل B: متمركز حول النوع
+    for key in ("digital", "turbo", "binary"):
+        try:
+            type_map = all_profit.get(key, {})
+            if isinstance(type_map, dict):
+                v = type_map.get(asset)
+                if v:
+                    candidates.append(float(v) * 100.0)
+        except Exception:
+            pass
+
+    return max(candidates) if candidates else 0.0
+
+
 def get_tradable_assets(base_assets, notified_assets):
     """
-    يمسح السوق ويعيد أصولًا مفتوحة (Turbo أو Digital حسب الفلاغ) وبعائد كافٍ.
+    يمسح السوق ويعيد أصولًا مفتوحة (Turbo/Binary أو Digital حسب الفلاغ) وبعائد كافٍ.
     """
     logger.info("Scanning market for tradable assets...")
     try:
@@ -252,25 +297,30 @@ def get_tradable_assets(base_assets, notified_assets):
                     digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
                 except Exception:
                     digital_open = False
-            turbo_open = bool(ot.get('turbo', {}).get(asset, {}).get('open'))
 
-            # الأصل مفتوح إذا Turbo مفتوح، أو Digital مفتوح ومُفعّل
-            if not (turbo_open or (ENABLE_DIGITAL and digital_open)):
-                continue
-
-            ap = all_profit.get(asset, {}) or {}
-
-            # احسب أعلى عائد متاح بين digital/turbo/binary
-            payout_candidates = []
-            for key in ("digital", "turbo", "binary"):
+            short_open = False
+            for cat in ("turbo", "binary"):
                 try:
-                    val = ap.get(key)
-                    if val:
-                        payout_candidates.append(float(val) * 100.0)
+                    if bool(ot.get(cat, {}).get(asset, {}).get('open')):
+                        short_open = True
+                        break
                 except Exception:
                     pass
 
-            payout = max(payout_candidates) if payout_candidates else 0.0
+            # الأصل مفتوح إذا كان short_open أو (digital_open ومفعّل)
+            if not (short_open or (ENABLE_DIGITAL and digital_open)):
+                continue
+
+            payout = _best_payout_from_all_profit(all_profit, asset)
+
+            # DEBUG اختيارية: اطبع سطر تشخيص لو العائد صفر
+            if payout == 0.0:
+                dbg_ap_asset = all_profit.get(asset, {})
+                dbg_ap_turbo = (all_profit.get("turbo", {}) or {}).get(asset)
+                dbg_ap_binary = (all_profit.get("binary", {}) or {}).get(asset)
+                dbg_ap_digital = (all_profit.get("digital", {}) or {}).get(asset)
+                logger.debug(f"[PAYOUT=0] {asset} | ap_asset={dbg_ap_asset} | turbo={dbg_ap_turbo} | binary={dbg_ap_binary} | digital={dbg_ap_digital}")
+
             if payout >= MINIMUM_PAYOUT:
                 tradable_assets.append({'name': asset, 'payout': payout})
 
