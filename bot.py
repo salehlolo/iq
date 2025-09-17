@@ -10,6 +10,10 @@ import pandas_ta as ta
 import sys
 import datetime
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
 # ==============================================================================
 # --- 1. إعدادات السكريبت ---
 # ==============================================================================
@@ -69,7 +73,6 @@ SLOW_MA_PERIOD = 21     # المتوسط المتحرك البطيء
 # ==============================================================================
 
 # إعداد نظام تسجيل الأحداث لعرض المعلومات بشكل واضح
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 Iq = IQ_Option(EMAIL, PASSWORD)
 
@@ -87,33 +90,38 @@ def connect_to_iq_option():
         return False
 
 
-def get_open_state(iq, asset):
-    """
-    يرجع حالتي الفتح لـ Digital و (Turbo/Binary قصير المدى) مع احترام ENABLE_DIGITAL.
-    """
-    digital_open = False
-    short_open = False  # Turbo أو Binary
+def _asset_forms(asset):
+    # جرّب الصيغ الأكثر شيوعًا
+    forms = {asset, asset.upper(), asset.lower()}
+    # صيغ إضافية محتملة (خاصة بالمنصة)
+    if not asset.endswith("-OTC"):
+        forms.add(f"{asset}-OTC")
+        forms.add(f"{asset.lower()}-otc")
+        forms.add(f"{asset.upper()}-OTC")
+    return list(forms)
 
+
+def _get_open_flag(ot, cat, asset):
+    for key in _asset_forms(asset):
+        try:
+            if bool(ot.get(cat, {}).get(key, {}).get('open')):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def get_open_state(iq, asset):
+    digital_open = False
+    short_open = False
     try:
         ot = iq.get_all_open_time() or {}
-
         if ENABLE_DIGITAL:
-            try:
-                digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
-            except Exception:
-                digital_open = False
-
-        # اعتبر أي من turbo أو binary كـ "قصير المدى" مفتوح
-        for cat in ("turbo", "binary"):
-            try:
-                if bool(ot.get(cat, {}).get(asset, {}).get('open')):
-                    short_open = True
-                    break
-            except Exception:
-                pass
+            digital_open = _get_open_flag(ot, "digital", asset)
+        # اعتبر أي من turbo أو binary كـ “قصير المدى”
+        short_open = _get_open_flag(ot, "turbo", asset) or _get_open_flag(ot, "binary", asset)
     except Exception as e:
         logger.error(f"⚠️ تعذر جلب حالة الفتح لـ {asset}: {e}")
-
     return digital_open, short_open
 
 
@@ -231,35 +239,34 @@ def place_trade(iq, asset, direction):
 
 def _best_payout_from_all_profit(all_profit, asset):
     """
-    يدعم شكلين من هيكلة get_all_profit:
+    يدعم شكلين:
     A) {asset: {'turbo':0.84,'digital':0.84,'binary':0.84}}
     B) {'turbo':{asset:0.84}, 'digital':{asset:0.84}, 'binary':{asset:0.84}}
-    يرجّع أعلى عائد كنسبة مئوية [0..100]
+    ويحاول صيغ أسماء أصول متعددة.
     """
     candidates = []
-
-    # شكل A: متمركز حول الأصل
-    try:
-        ap = all_profit.get(asset, {})
-        if isinstance(ap, dict):
-            for key in ("digital", "turbo", "binary"):
-                v = ap.get(key)
-                if v:
-                    candidates.append(float(v) * 100.0)
-    except Exception:
-        pass
-
-    # شكل B: متمركز حول النوع
+    # شكل A: في عقد الأصل
+    ap = all_profit.get(asset) or all_profit.get(asset.upper()) or all_profit.get(asset.lower()) or {}
+    if isinstance(ap, dict):
+        for key in ("digital", "turbo", "binary"):
+            v = ap.get(key)
+            if v:
+                try:
+                    candidates.append(float(v)*100.0)
+                except Exception:
+                    pass
+    # شكل B: في عقد النوع
     for key in ("digital", "turbo", "binary"):
-        try:
-            type_map = all_profit.get(key, {})
-            if isinstance(type_map, dict):
-                v = type_map.get(asset)
+        type_map = all_profit.get(key, {})
+        if isinstance(type_map, dict):
+            for a in _asset_forms(asset):
+                v = type_map.get(a)
                 if v:
-                    candidates.append(float(v) * 100.0)
-        except Exception:
-            pass
-
+                    try:
+                        candidates.append(float(v)*100.0)
+                    except Exception:
+                        pass
+                    break
     return max(candidates) if candidates else 0.0
 
 
@@ -284,6 +291,9 @@ def get_tradable_assets(base_assets, notified_assets):
         except Exception as e:
             logger.error(f"⚠️ تعذر جلب أوقات الفتح: {e}")
             ot = {}
+
+        logger.debug(f"all_profit keys: {list(all_profit.keys())[:5]}")
+        logger.debug(f"open_time categories: {list((ot or {}).keys())}")
 
         for asset in base_assets:
             # تبريد التنبيهات
@@ -315,11 +325,11 @@ def get_tradable_assets(base_assets, notified_assets):
 
             # DEBUG اختيارية: اطبع سطر تشخيص لو العائد صفر
             if payout == 0.0:
-                dbg_ap_asset = all_profit.get(asset, {})
-                dbg_ap_turbo = (all_profit.get("turbo", {}) or {}).get(asset)
-                dbg_ap_binary = (all_profit.get("binary", {}) or {}).get(asset)
-                dbg_ap_digital = (all_profit.get("digital", {}) or {}).get(asset)
-                logger.debug(f"[PAYOUT=0] {asset} | ap_asset={dbg_ap_asset} | turbo={dbg_ap_turbo} | binary={dbg_ap_binary} | digital={dbg_ap_digital}")
+                logger.debug(f"[PAYOUT=0] {asset} forms={_asset_forms(asset)} sample="
+                             f"asset_map={all_profit.get(asset) or all_profit.get(asset.upper()) or all_profit.get(asset.lower())} "
+                             f"turbo={(all_profit.get('turbo', {}) or {}).get(asset)} "
+                             f"binary={(all_profit.get('binary', {}) or {}).get(asset)} "
+                             f"digital={(all_profit.get('digital', {}) or {}).get(asset)}")
 
             if payout >= MINIMUM_PAYOUT:
                 tradable_assets.append({'name': asset, 'payout': payout})
@@ -394,6 +404,7 @@ def run_signal_generator():
         f"COOLDOWN_S={COOLDOWN_S}, MAX_DAILY_TRADES={MAX_DAILY_TRADES}, MAX_DAILY_LOSS={MAX_DAILY_LOSS}"
     )
     logger.info(f"ENABLE_DIGITAL={ENABLE_DIGITAL}")
+    logger.info(f"MINIMUM_PAYOUT={MINIMUM_PAYOUT}")
 
     while True:
         try:
