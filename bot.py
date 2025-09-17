@@ -271,15 +271,11 @@ def _best_payout_from_all_profit(all_profit, asset):
 
 
 def get_tradable_assets(base_assets, notified_assets):
-    """
-    يمسح السوق ويعيد أصولًا مفتوحة (Turbo/Binary أو Digital حسب الفلاغ) وبعائد كافٍ.
-    """
     logger.info("Scanning market for tradable assets...")
     try:
         tradable_assets = []
         now = time.time()
 
-        # جلب العوائد وأوقات الفتح بأمان
         try:
             all_profit = Iq.get_all_profit() or {}
         except Exception as e:
@@ -296,11 +292,17 @@ def get_tradable_assets(base_assets, notified_assets):
         logger.debug(f"open_time categories: {list((ot or {}).keys())}")
 
         for asset in base_assets:
-            # تبريد التنبيهات
             if asset in notified_assets and now < notified_assets[asset]:
                 continue
 
-            # حالات الفتح
+            payout = _best_payout_from_all_profit(all_profit, asset)
+
+            # لو العائد موجود وكبير كفاية، خليه يمرّ بغض النظر عن open_time
+            if payout >= MINIMUM_PAYOUT:
+                tradable_assets.append({'name': asset, 'payout': payout})
+                continue
+
+            # لو العائد صفر، افحص حالة الفتح (قصير المدى أو ديجيتال إذا مفعّل)
             digital_open = False
             if ENABLE_DIGITAL:
                 try:
@@ -317,22 +319,12 @@ def get_tradable_assets(base_assets, notified_assets):
                 except Exception:
                     pass
 
-            # الأصل مفتوح إذا كان short_open أو (digital_open ومفعّل)
-            if not (short_open or (ENABLE_DIGITAL and digital_open)):
-                continue
-
-            payout = _best_payout_from_all_profit(all_profit, asset)
-
-            # DEBUG اختيارية: اطبع سطر تشخيص لو العائد صفر
             if payout == 0.0:
                 logger.debug(f"[PAYOUT=0] {asset} forms={_asset_forms(asset)} sample="
                              f"asset_map={all_profit.get(asset) or all_profit.get(asset.upper()) or all_profit.get(asset.lower())} "
                              f"turbo={(all_profit.get('turbo', {}) or {}).get(asset)} "
                              f"binary={(all_profit.get('binary', {}) or {}).get(asset)} "
                              f"digital={(all_profit.get('digital', {}) or {}).get(asset)}")
-
-            if payout >= MINIMUM_PAYOUT:
-                tradable_assets.append({'name': asset, 'payout': payout})
 
         if tradable_assets:
             logger.info(f"Found {len(tradable_assets)} tradable assets to monitor.")
