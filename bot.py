@@ -33,6 +33,8 @@ AUTO_TRADE = os.getenv("AUTO_TRADE", "1").strip().lower() in {"1", "true", "on",
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "1"))  # قيمة الصفقة
 EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "1"))  # انتهاء الصفقة بالدقائق (١ دقيقة)
 COOLDOWN_S = int(os.getenv("COOLDOWN_S", "120"))  # فترة تبريد لكل أصل لمنع تكرار الدخول
+BINARY_EXPIRY_MIN = int(os.getenv("BINARY_EXPIRY_MIN", "15"))  # مدة انتهاء للـ Binary
+ENTRY_CUTOFF_S = int(os.getenv("ENTRY_CUTOFF_S", "5"))      # لا ندخل لو باقي <= هذه الثواني على إغلاق الدقيقة
 _last_trade_ts = {}
 
 ENABLE_DIGITAL = os.getenv("ENABLE_DIGITAL", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -106,17 +108,21 @@ def _get_open_flag(ot, cat, asset):
 
 
 def get_open_state(iq, asset):
+    """
+    يرجع ثلاثي: (digital_open, turbo_open, binary_open)
+    """
     digital_open = False
     turbo_open = False
+    binary_open = False
     try:
         ot = iq.get_all_open_time() or {}
         if ENABLE_DIGITAL:
             digital_open = _get_open_flag(ot, "digital", asset)
-        # اعتبر أي من turbo أو binary كـ “قصير المدى”
-        turbo_open = _get_open_flag(ot, "turbo", asset) or _get_open_flag(ot, "binary", asset)
+        turbo_open = _get_open_flag(ot, "turbo", asset)
+        binary_open = _get_open_flag(ot, "binary", asset)
     except Exception as e:
         logger.error(f"⚠️ تعذر جلب حالة الفتح لـ {asset}: {e}")
-    return digital_open, turbo_open
+    return digital_open, turbo_open, binary_open
 
 
 def reset_daily_counters_if_needed():
@@ -179,6 +185,12 @@ def _monitor_trade_result(iq, order_id, asset, direction, is_digital):
         logger.info(f"➖ الصفقة {direction.upper()} على {asset} انتهت بالتعادل")
 
 
+def _sec_to_next_minute():
+    # تقريبية لكن كافية؛ إن أردت الدقة استخدم توقيت السيرفر إذا توفر
+    now = time.time()
+    return 60 - (int(now) % 60)
+
+
 def place_trade(iq, asset, direction):
     """إرسال صفقة مع مراعاة التبريد واختيار الأداة الأنسب (Digital ثم Turbo)."""
     reset_daily_counters_if_needed()
@@ -188,29 +200,49 @@ def place_trade(iq, asset, direction):
         logger.info(f"⏳ تبريد مفعّل لـ {asset}.. تخطي الدخول")
         return False
 
-    digital_open, turbo_open = get_open_state(iq, asset)
+    digital_open, turbo_open, binary_open = get_open_state(iq, asset)
 
     ok = False
     order_id = None
     is_digital = False
+    mode = None
+    logger.info(f"OpenState[{asset}] => digital={digital_open}, turbo={turbo_open}, binary={binary_open}")
 
-    # Digital أولًا فقط إذا مفعّل ومفتوح
+    # 0) نافذة أمان للـ Turbo دقيقة واحدة
+    if turbo_open and EXPIRY_MIN == 1:
+        rem = _sec_to_next_minute()
+        if rem <= ENTRY_CUTOFF_S:
+            logger.info(f"⏱️ قريب جدًا من إغلاق الشمعة ({rem}s)… تخطي الدخول على {asset}")
+            return False
+
+    # 1) Digital أولًا فقط إذا مفعّل ومفتوح
     if ENABLE_DIGITAL and digital_open:
-        logger.info(f"🛒 محاولة تنفيذ Digital على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
+        mode = "DIGITAL"
+        logger.info(f"🛒 محاولة تنفيذ {mode} على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         is_digital = True
         ok, order_id = iq.buy_digital_spot(asset, TRADE_AMOUNT, direction, EXPIRY_MIN)
         if not ok:
-            logger.info(f"↩️ فشل Digital على {asset}، سنحاول Turbo إن أمكن")
+            logger.info(f"↩️ فشل {mode} على {asset}، سنحاول TURBO/BINARY إن أمكن")
             is_digital = False
+            mode = None
 
-    # Turbo
+    # 2) Turbo إن كان مفتوحًا
     if not ok and turbo_open:
-        logger.info(f"🛒 محاولة تنفيذ Turbo على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
-        ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
+        mode = "TURBO"
+        expiry = EXPIRY_MIN  # 1 عادة
+        logger.info(f"🛒 محاولة تنفيذ {mode} على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {expiry} دقيقة")
+        ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, expiry)
+
+    # 3) Binary إن كان مفتوحًا (استخدم مدة binary الافتراضية مثل 15 دقيقة)
+    if not ok and binary_open:
+        mode = "BINARY"
+        expiry = max(BINARY_EXPIRY_MIN, 15)
+        logger.info(f"🛒 محاولة تنفيذ {mode} على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {expiry} دقيقة")
+        ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, expiry)
 
     if ok:
-        logger.warning(f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id} | mode={'DIGITAL' if is_digital else 'TURBO'}")
-        _last_trade_ts[asset] = now
+        logger.warning(f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id} | mode={mode or ('DIGITAL' if is_digital else 'TURBO')}")
+        _last_trade_ts[asset] = time.time()
         global daily_trades
         with daily_lock:
             daily_trades += 1
@@ -221,10 +253,10 @@ def place_trade(iq, asset, direction):
         ).start()
         return True
     else:
-        if not (digital_open or turbo_open):
-            logger.error(f"❌ فشل إرسال الصفقة: {asset} مغلق الآن (لا Digital ولا Turbo/Binary).")
+        if not (digital_open or turbo_open or binary_open):
+            logger.error(f"❌ فشل إرسال الصفقة: {asset} مغلق الآن (لا Digital ولا Turbo ولا Binary).")
         else:
-            logger.error(f"❌ فشل إرسال الصفقة على {asset} رغم كون الأداة مفتوحة. تحقق من صلاحية الحساب أو توقيت الشمعة.")
+            logger.error(f"❌ فشل إرسال الصفقة على {asset} رغم كون الأداة مفتوحة. جرّب ضبط المدة أو تجنّب نافذة الإغلاق.")
         return False
 
 # ==============================================================================
