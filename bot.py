@@ -191,6 +191,26 @@ def _sec_to_next_minute():
     return 60 - (int(now) % 60)
 
 
+def _minutes_to_next_quarter(server_ts: float, cutoff_s: int) -> int:
+    """
+    يحسب الدقائق حتى أقرب فتحة ربع ساعة (00/15/30/45) وفق توقيت خادم IQ.
+    يضيف دقيقة لو كنا داخل نافذة الأمان الأخيرة من الدقيقة الحالية.
+    يضمن ألا نرجع مدة < 5 دقائق للـ Binary؛ وإن حدث، ننتقل للربع التالي.
+    """
+    dt = datetime.datetime.fromtimestamp(server_ts)
+    # دقائق حتى ربع الساعة التالي
+    qrem = (15 - (dt.minute % 15)) % 15
+    if qrem == 0:
+        qrem = 15
+    # لو نحن داخل آخر ثواني من الدقيقة الحالية → زُح للربع التالي
+    if dt.second >= 60 - max(cutoff_s, 1):
+        qrem += 1
+    # الـ Binary يحتاج عادة ≥ 5 دقائق (وأحيانًا يُقبل فقط ربع ساعة)
+    if qrem < 5:
+        qrem += 15
+    return qrem
+
+
 def place_trade(iq, asset, direction):
     """إرسال صفقة مع مراعاة التبريد واختيار الأداة الأنسب (Digital ثم Turbo)."""
     reset_daily_counters_if_needed()
@@ -233,12 +253,22 @@ def place_trade(iq, asset, direction):
         logger.info(f"🛒 محاولة تنفيذ {mode} على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {expiry} دقيقة")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, expiry)
 
-    # 3) Binary إن كان مفتوحًا (استخدم مدة binary الافتراضية مثل 15 دقيقة)
+    # 3) Binary إن كان مفتوحًا → احسب مدة محاذاة ربع الساعة بدقة
     if not ok and binary_open:
         mode = "BINARY"
-        expiry = max(BINARY_EXPIRY_MIN, 15)
-        logger.info(f"🛒 محاولة تنفيذ {mode} على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {expiry} دقيقة")
+        try:
+            server_ts = Iq.get_server_timestamp() or time.time()
+        except Exception:
+            server_ts = time.time()
+        expiry = _minutes_to_next_quarter(server_ts, ENTRY_CUTOFF_S)
+        logger.info(f"🛒 محاولة تنفيذ {mode} على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {expiry} دقيقة (محاذاة ربع الساعة)")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, expiry)
+
+        # Fallback: لو فشل، جرّب الربع التالي مباشرة
+        if not ok:
+            expiry += 15
+            logger.info(f"↩️ إعادة المحاولة {mode} على {asset} بمدة {expiry} دقيقة (الربع التالي)")
+            ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, expiry)
 
     if ok:
         logger.warning(f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id} | mode={mode or ('DIGITAL' if is_digital else 'TURBO')}")
