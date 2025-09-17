@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import threading
+import iq  # noqa: F401  # apply iqoptionapi stability patches
 from iqoptionapi.stable_api import IQ_Option
 import pandas as pd
 import pandas_ta as ta
@@ -27,21 +28,14 @@ ACCOUNT_TYPE = "PRACTICE"
 MINIMUM_PAYOUT = int(os.getenv("MINIMUM_PAYOUT", "70"))
 
 
-def _bool_env(var_name, default):
-    value = os.getenv(var_name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 # -- إعدادات التنفيذ التلقائي --
-AUTO_TRADE = _bool_env("AUTO_TRADE", True)  # شغّل/طفّي التنفيذ التلقائي
+AUTO_TRADE = os.getenv("AUTO_TRADE", "1").strip().lower() in {"1", "true", "on", "yes"}
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "1"))  # قيمة الصفقة
 EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "1"))  # انتهاء الصفقة بالدقائق (١ دقيقة)
 COOLDOWN_S = int(os.getenv("COOLDOWN_S", "120"))  # فترة تبريد لكل أصل لمنع تكرار الدخول
-last_trade_ts = {}
+_last_trade_ts = {}
 
-ENABLE_DIGITAL = _bool_env("ENABLE_DIGITAL", False)  # عطّل Digital افتراضيًا
+ENABLE_DIGITAL = os.getenv("ENABLE_DIGITAL", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # -- حدود إدارة المخاطر اليومية --
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "20"))
@@ -113,16 +107,16 @@ def _get_open_flag(ot, cat, asset):
 
 def get_open_state(iq, asset):
     digital_open = False
-    short_open = False
+    turbo_open = False
     try:
         ot = iq.get_all_open_time() or {}
         if ENABLE_DIGITAL:
             digital_open = _get_open_flag(ot, "digital", asset)
         # اعتبر أي من turbo أو binary كـ “قصير المدى”
-        short_open = _get_open_flag(ot, "turbo", asset) or _get_open_flag(ot, "binary", asset)
+        turbo_open = _get_open_flag(ot, "turbo", asset) or _get_open_flag(ot, "binary", asset)
     except Exception as e:
         logger.error(f"⚠️ تعذر جلب حالة الفتح لـ {asset}: {e}")
-    return digital_open, short_open
+    return digital_open, turbo_open
 
 
 def reset_daily_counters_if_needed():
@@ -190,11 +184,11 @@ def place_trade(iq, asset, direction):
     reset_daily_counters_if_needed()
 
     now = time.time()
-    if now - last_trade_ts.get(asset, 0) < COOLDOWN_S:
+    if now - _last_trade_ts.get(asset, 0) < COOLDOWN_S:
         logger.info(f"⏳ تبريد مفعّل لـ {asset}.. تخطي الدخول")
         return False
 
-    digital_open, short_open = get_open_state(iq, asset)
+    digital_open, turbo_open = get_open_state(iq, asset)
 
     ok = False
     order_id = None
@@ -210,13 +204,13 @@ def place_trade(iq, asset, direction):
             is_digital = False
 
     # Turbo
-    if not ok and short_open:
+    if not ok and turbo_open:
         logger.info(f"🛒 محاولة تنفيذ Turbo على {asset} | {direction.upper()} {TRADE_AMOUNT}$ لمدة {EXPIRY_MIN} دقيقة")
         ok, order_id = iq.buy(TRADE_AMOUNT, asset, direction, EXPIRY_MIN)
 
     if ok:
         logger.warning(f"🧾 أُرسلت صفقة {direction.upper()} على {asset} بقيمة {TRADE_AMOUNT} | id={order_id} | mode={'DIGITAL' if is_digital else 'TURBO'}")
-        last_trade_ts[asset] = now
+        _last_trade_ts[asset] = now
         global daily_trades
         with daily_lock:
             daily_trades += 1
@@ -227,7 +221,7 @@ def place_trade(iq, asset, direction):
         ).start()
         return True
     else:
-        if not (digital_open or short_open):
+        if not (digital_open or turbo_open):
             logger.error(f"❌ فشل إرسال الصفقة: {asset} مغلق الآن (لا Digital ولا Turbo/Binary).")
         else:
             logger.error(f"❌ فشل إرسال الصفقة على {asset} رغم كون الأداة مفتوحة. تحقق من صلاحية الحساب أو توقيت الشمعة.")
@@ -237,44 +231,58 @@ def place_trade(iq, asset, direction):
 # --- 3. وظائف الاستراتيجية والتحليل ---
 # ==============================================================================
 
-def _best_payout_from_all_profit(all_profit, asset):
+def best_payout(all_profit, asset):
     """
     يدعم شكلين:
     A) {asset: {'turbo':0.84,'digital':0.84,'binary':0.84}}
     B) {'turbo':{asset:0.84}, 'digital':{asset:0.84}, 'binary':{asset:0.84}}
-    ويحاول صيغ أسماء أصول متعددة.
+    يرجّع أعلى عائد كنسبة مئوية [0..100]
     """
-    candidates = []
-    # شكل A: في عقد الأصل
-    ap = all_profit.get(asset) or all_profit.get(asset.upper()) or all_profit.get(asset.lower()) or {}
-    if isinstance(ap, dict):
-        for key in ("digital", "turbo", "binary"):
-            v = ap.get(key)
-            if v:
-                try:
-                    candidates.append(float(v)*100.0)
-                except Exception:
-                    pass
-    # شكل B: في عقد النوع
-    for key in ("digital", "turbo", "binary"):
-        type_map = all_profit.get(key, {})
-        if isinstance(type_map, dict):
-            for a in _asset_forms(asset):
-                v = type_map.get(a)
+    cands = []
+
+    # شكل A: متمركز حول الأصل
+    try:
+        ap = (
+            all_profit.get(asset)
+            or all_profit.get(asset.upper())
+            or all_profit.get(asset.lower())
+            or {}
+        )
+        if isinstance(ap, dict):
+            for key in ("digital", "turbo", "binary"):
+                v = ap.get(key)
                 if v:
                     try:
-                        candidates.append(float(v)*100.0)
+                        cands.append(float(v) * 100.0)
                     except Exception:
                         pass
-                    break
-    return max(candidates) if candidates else 0.0
+    except Exception:
+        pass
+
+    # شكل B: متمركز حول النوع
+    for key in ("digital", "turbo", "binary"):
+        try:
+            type_map = all_profit.get(key, {})
+            if isinstance(type_map, dict):
+                for a in _asset_forms(asset):
+                    v = type_map.get(a)
+                    if v:
+                        try:
+                            cands.append(float(v) * 100.0)
+                            break
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return max(cands) if cands else 0.0
 
 
 def get_tradable_assets(base_assets, notified_assets):
     logger.info("Scanning market for tradable assets...")
     try:
-        tradable_assets = []
         now = time.time()
+        tradable_assets = []
 
         try:
             all_profit = Iq.get_all_profit() or {}
@@ -288,52 +296,33 @@ def get_tradable_assets(base_assets, notified_assets):
             logger.error(f"⚠️ تعذر جلب أوقات الفتح: {e}")
             ot = {}
 
-        logger.debug(f"all_profit keys: {list(all_profit.keys())[:5]}")
-        logger.debug(f"open_time categories: {list((ot or {}).keys())}")
-
         for asset in base_assets:
             if asset in notified_assets and now < notified_assets[asset]:
                 continue
 
-            payout = _best_payout_from_all_profit(all_profit, asset)
-
-            # لو العائد موجود وكبير كفاية، خليه يمرّ بغض النظر عن open_time
-            if payout >= MINIMUM_PAYOUT:
-                tradable_assets.append({'name': asset, 'payout': payout})
-                continue
-
-            # لو العائد صفر، افحص حالة الفتح (قصير المدى أو ديجيتال إذا مفعّل)
             digital_open = False
             if ENABLE_DIGITAL:
                 try:
-                    digital_open = bool(ot.get('digital', {}).get(asset, {}).get('open'))
+                    digital_open = _get_open_flag(ot, "digital", asset)
                 except Exception:
                     digital_open = False
+            turbo_open = _get_open_flag(ot, "turbo", asset) or _get_open_flag(ot, "binary", asset)
 
-            short_open = False
-            for cat in ("turbo", "binary"):
-                try:
-                    if bool(ot.get(cat, {}).get(asset, {}).get('open')):
-                        short_open = True
-                        break
-                except Exception:
-                    pass
+            if not (turbo_open or (ENABLE_DIGITAL and digital_open)):
+                continue
 
-            if payout == 0.0:
-                logger.debug(f"[PAYOUT=0] {asset} forms={_asset_forms(asset)} sample="
-                             f"asset_map={all_profit.get(asset) or all_profit.get(asset.upper()) or all_profit.get(asset.lower())} "
-                             f"turbo={(all_profit.get('turbo', {}) or {}).get(asset)} "
-                             f"binary={(all_profit.get('binary', {}) or {}).get(asset)} "
-                             f"digital={(all_profit.get('digital', {}) or {}).get(asset)}")
+            payout = best_payout(all_profit, asset)
+            if payout >= MINIMUM_PAYOUT:
+                tradable_assets.append({"name": asset, "payout": payout})
 
         if tradable_assets:
             logger.info(f"Found {len(tradable_assets)} tradable assets to monitor.")
         else:
             logger.warning("No tradable assets with sufficient payout found at the moment.")
-        return tradable_assets
+        return tradable_assets, all_profit
     except Exception as e:
         logger.error(f"Could not scan market due to an error: {e}")
-        return []
+        return [], {}
 
 
 def get_and_prepare_data(asset):
@@ -412,8 +401,8 @@ def run_signal_generator():
             logger.info("--------------------------------------------------")
             
             # مسح السوق بحثاً عن أصول متاحة للتداول
-            tradable_assets = get_tradable_assets(base_asset_list, notified_assets)
-            
+            tradable_assets, all_profit = get_tradable_assets(base_asset_list, notified_assets)
+
             if not tradable_assets:
                 time.sleep(60) # إذا لم تكن هناك أصول، انتظر دقيقة كاملة
                 continue
@@ -421,9 +410,9 @@ def run_signal_generator():
             # المرور على الأصول المتاحة وتحليلها
             for asset_info in tradable_assets:
                 asset_name = asset_info['name']
-                asset_payout = asset_info['payout']
+                asset_payout = best_payout(all_profit, asset_name)
 
-                logger.info(f"🔍 Analyzing: {asset_name} (Payout: {asset_payout:.0f}%)")
+                logger.info(f"🔍 Analyzing: {asset_name} (Payout: {int(asset_payout)}%)")
                 data_df = get_and_prepare_data(asset_name)
 
                 if data_df is not None:
